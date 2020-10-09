@@ -264,6 +264,88 @@ impl Visitor for CompileControl {
         Ok(Action::Change(Control::enable(while_group)))
     }
 
+    // fn finish_seq(
+    //     &mut self,
+    //     s: &ast::Seq,
+    //     comp: &mut Component,
+    //     ctx: &Context,
+    // ) -> VisResult {
+    //     let st = &mut comp.structure;
+
+    //     // Create a new group for the seq related structure.
+    //     let seq_group: ast::Id = st.namegen.gen_name("seq").into();
+    //     let seq_group_node = st.insert_group(&seq_group, HashMap::new())?;
+    //     let fsm_size = 32;
+
+    //     // new structure
+    //     structure!(st, &ctx,
+    //         let fsm = prim std_reg(fsm_size);
+    //         let signal_on = constant(1, 1);
+    //     );
+
+    //     // Generate fsm to drive the sequence
+    //     for (idx, con) in s.stmts.iter().enumerate() {
+    //         match con {
+    //             Control::Enable {
+    //                 data: Enable { comp: group_name },
+    //             } => {
+    //                 let my_idx: u64 = idx.try_into().unwrap();
+    //                 /* group[go] = fsm.out == idx & !group[done] ? 1 */
+    //                 let group = st.get_node_by_name(&group_name)?;
+
+    //                 structure!(st, &ctx,
+    //                     let fsm_cur_state = constant(my_idx, fsm_size);
+    //                     let fsm_nxt_state = constant(my_idx + 1, fsm_size);
+    //                 );
+
+    //                 let group_go = (guard!(st; fsm["out"])
+    //                     .eq(st.to_guard(fsm_cur_state.clone())))
+    //                     & !guard!(st; group["done"]);
+
+    //                 let group_done = (guard!(st; fsm["out"])
+    //                     .eq(st.to_guard(fsm_cur_state.clone())))
+    //                     & guard!(st; group["done"]);
+
+    //                 add_wires!(st, Some(seq_group.clone()),
+    //                     // Turn this group on.
+    //                     group["go"] = group_go ? (signal_on.clone());
+
+    //                     // Update the FSM state when this group is done.
+    //                     fsm["in"] = group_done ? (fsm_nxt_state.clone());
+    //                     fsm["write_en"] = group_done ? (signal_on.clone());
+    //                 );
+    //             }
+    //             _ => {
+    //                 return Err(Error::MalformedControl(
+    //                     "Cannot compile non-group statement inside sequence"
+    //                         .to_string(),
+    //                 ))
+    //             }
+    //         }
+    //     }
+
+    //     let final_state_val: u64 = s.stmts.len().try_into().unwrap();
+    //     structure!(st, &ctx,
+    //         let reset_val = constant(0, fsm_size);
+    //         let fsm_final_state = constant(final_state_val, fsm_size);
+    //     );
+    //     let seq_done = guard!(st; fsm["out"]).eq(st.to_guard(fsm_final_state));
+
+    //     // Condition for the seq group being done.
+    //     add_wires!(st, Some(seq_group.clone()),
+    //         seq_group_node["done"] = seq_done ? (signal_on.clone());
+    //     );
+
+    //     // CLEANUP: Reset the FSM state one cycle after the done signal is high.
+    //     add_wires!(st, None,
+    //         fsm["in"] = seq_done ? (reset_val);
+    //         fsm["write_en"] = seq_done ? (signal_on);
+    //     );
+
+    //     // Replace the control with the seq group.
+    //     Ok(Action::Change(Control::enable(seq_group)))
+    // }
+
     fn finish_seq(
         &mut self,
         s: &ast::Seq,
@@ -279,41 +361,90 @@ impl Visitor for CompileControl {
 
         // new structure
         structure!(st, &ctx,
-            let fsm = prim std_reg(fsm_size);
+            // let fsm = prim std_reg(fsm_size);
             let signal_on = constant(1, 1);
+            let signal_off = constant(0, 1);
         );
 
+        let seq_done = guard!(st; seq_group_node["done"]);
+
+        let mut prev_done = None;
+
         // Generate fsm to drive the sequence
-        for (idx, con) in s.stmts.iter().enumerate() {
+        for (_idx, con) in s.stmts.iter().enumerate() {
             match con {
                 Control::Enable {
                     data: Enable { comp: group_name },
                 } => {
-                    let my_idx: u64 = idx.try_into().unwrap();
+                    // let my_idx: u64 = idx.try_into().unwrap();
                     /* group[go] = fsm.out == idx & !group[done] ? 1 */
                     let group = st.get_node_by_name(&group_name)?;
 
-                    structure!(st, &ctx,
-                        let fsm_cur_state = constant(my_idx, fsm_size);
-                        let fsm_nxt_state = constant(my_idx + 1, fsm_size);
+                    structure!(
+                        st, &ctx,
+                        // let fsm_cur_state = constant(my_idx, fsm_size);
+                        // let fsm_nxt_state = constant(my_idx + 1, fsm_size);
+                        let started = prim std_reg(1);
+                        let done_reg = prim std_reg(1);
                     );
 
-                    let group_go = (guard!(st; fsm["out"])
-                        .eq(st.to_guard(fsm_cur_state.clone())))
-                        & !guard!(st; group["done"]);
+                    // let group_go = match prev_done {
+                    //     Some(g) => {
+                    //         guard!(st; fsm["out"])
+                    //             .eq(st.to_guard(fsm_cur_state.clone()))
+                    //             | g
+                    //     }
+                    //     None => guard!(st; fsm["out"])
+                    //         .eq(st.to_guard(fsm_cur_state.clone())),
+                    // };
+                    let start = match prev_done.clone() {
+                        Some(g) => g & !guard!(st; done_reg["out"]),
+                        None => !guard!(st; done_reg["out"]),
+                    };
+                    let group_go = match prev_done.clone() {
+                        Some(g) => {
+                            (g | guard!(st; started["out"]))
+                                & !guard!(st; done_reg["out"])
+                        }
+                        None => !guard!(st; done_reg["out"]),
+                    };
 
-                    let group_done = (guard!(st; fsm["out"])
-                        .eq(st.to_guard(fsm_cur_state.clone())))
-                        & guard!(st; group["done"]);
+                    // let group_done = (guard!(st; fsm["out"])
+                    //     .eq(st.to_guard(fsm_cur_state.clone())))
+                    //     & guard!(st; group["done"]);
+                    let group_done = match prev_done {
+                        Some(g) => (g & guard!(st; group["done"])),
+                        None => guard!(st; group["done"]),
+                    };
 
-                    add_wires!(st, Some(seq_group.clone()),
+                    add_wires!(
+                        st, Some(seq_group.clone()),
+                        // save groups start signal
+                        started["in"] = start ? (signal_on.clone());
+                        started["write_en"] = start ? (signal_on.clone());
+
+                        // save groups done signal
+                        done_reg["in"] = group_done ? (signal_on.clone());
+                        done_reg["write_en"] = group_done ? (signal_on.clone());
+
                         // Turn this group on.
                         group["go"] = group_go ? (signal_on.clone());
 
                         // Update the FSM state when this group is done.
-                        fsm["in"] = group_done ? (fsm_nxt_state.clone());
-                        fsm["write_en"] = group_done ? (signal_on.clone());
+                        // fsm["in"] = group_done ? (fsm_nxt_state.clone());
+                        // fsm["write_en"] = group_done ? (signal_on.clone());
                     );
+
+                    // CLEANUP: Reset the done registers.
+                    add_wires!(
+                        st, None,
+                        done_reg["in"] = seq_done ? (signal_off.clone());
+                        done_reg["write_en"] = seq_done ? (signal_on.clone());
+                        started["in"] = seq_done ? (signal_off.clone());
+                        started["write_en"] = seq_done ? (signal_on.clone());
+                    );
+
+                    prev_done = Some(guard!(st; group["done"]));
                 }
                 _ => {
                     return Err(Error::MalformedControl(
@@ -324,23 +455,24 @@ impl Visitor for CompileControl {
             }
         }
 
-        let final_state_val: u64 = s.stmts.len().try_into().unwrap();
-        structure!(st, &ctx,
-            let reset_val = constant(0, fsm_size);
-            let fsm_final_state = constant(final_state_val, fsm_size);
-        );
-        let seq_done = guard!(st; fsm["out"]).eq(st.to_guard(fsm_final_state));
+        // let final_state_val: u64 = s.stmts.len().try_into().unwrap();
+        // structure!(st, &ctx,
+        //     let reset_val = constant(0, fsm_size);
+        //     let fsm_final_state = constant(final_state_val, fsm_size);
+        // );
+        // let seq_done = guard!(st; fsm["out"]).eq(st.to_guard(fsm_final_state));
 
-        // Condition for the seq group being done.
+        // // Condition for the seq group being done.
+        let last_done = prev_done.unwrap();
         add_wires!(st, Some(seq_group.clone()),
-            seq_group_node["done"] = seq_done ? (signal_on.clone());
+            seq_group_node["done"] = last_done ? (signal_on.clone());
         );
 
-        // CLEANUP: Reset the FSM state one cycle after the done signal is high.
-        add_wires!(st, None,
-            fsm["in"] = seq_done ? (reset_val);
-            fsm["write_en"] = seq_done ? (signal_on);
-        );
+        // // CLEANUP: Reset the FSM state one cycle after the done signal is high.
+        // add_wires!(st, None,
+        //     fsm["in"] = seq_done ? (reset_val);
+        //     fsm["write_en"] = seq_done ? (signal_on);
+        // );
 
         // Replace the control with the seq group.
         Ok(Action::Change(Control::enable(seq_group)))
