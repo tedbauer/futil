@@ -1,12 +1,13 @@
-use crate::errors::Error;
+use crate::errors::{Error, Result};
 use crate::lang::{
-    ast, component::Component, context::Context, structure_builder::ASTBuilder,
+    ast, component::Component, context::Context, structure::StructureGraph,
+    structure_builder::ASTBuilder,
 };
 use crate::passes::visitor::{Action, Named, VisResult, Visitor};
 use crate::{add_wires, guard, port, structure};
 use ast::{Control, Enable, GuardExpr};
+use petgraph::graph::NodeIndex;
 use std::collections::HashMap;
-use std::convert::TryInto;
 
 #[derive(Default)]
 pub struct CompileControl {}
@@ -18,6 +19,41 @@ impl Named for CompileControl {
 
     fn description() -> &'static str {
         "Compile away all control language constructs into structure"
+    }
+}
+
+fn latch_combinational(
+    st: &mut StructureGraph,
+    ctx: &Context,
+    ctrl_group: ast::Id,
+    group: NodeIndex,
+    group_name: &ast::Id,
+    ctrl_done: GuardExpr,
+) -> Result<GuardExpr> {
+    if let Some(&1) =
+        st.groups[&Some(group_name.clone())].0.get("combinational")
+    {
+        structure!(
+            st, &ctx,
+            let signal_on = constant(1, 1);
+            let signal_off = constant(0, 1);
+            let latch = prim std_reg(1);
+        );
+        let done_guard = guard!(st; group["done"]);
+        add_wires!(
+            st, Some(ctrl_group.clone()),
+            latch["in"] = done_guard ? (signal_on.clone());
+            latch["write_en"] = done_guard ? (signal_on.clone());
+        );
+        // CLEANUP wires
+        add_wires!(
+            st, None,
+            latch["in"] = ctrl_done ? (signal_off.clone());
+            latch["write_en"] = ctrl_done ? (signal_on.clone());
+        );
+        Ok(guard!(st; latch["out"]))
+    } else {
+        Ok(guard!(st; group["done"]))
     }
 }
 
@@ -376,46 +412,63 @@ impl Visitor for CompileControl {
                 Control::Enable {
                     data: Enable { comp: group_name },
                 } => {
-                    // let my_idx: u64 = idx.try_into().unwrap();
-                    /* group[go] = fsm.out == idx & !group[done] ? 1 */
                     let group = st.get_node_by_name(&group_name)?;
+
+                    // if group is combinational, introduce latch on done signal
+                    let done_latch = latch_combinational(
+                        st,
+                        ctx,
+                        seq_group.clone(),
+                        group,
+                        group_name,
+                        seq_done.clone(),
+                    )?;
+                    // let done_latch = if let Some(&1) = st.groups
+                    //     [&Some(group_name.clone())]
+                    //     .0
+                    //     .get("combinational")
+                    // {
+                    //     structure!(
+                    //         st, &ctx,
+                    //         let latch = prim std_reg(1);
+                    //     );
+                    //     let done_guard = guard!(st; group["done"]);
+                    //     add_wires!(
+                    //         st, Some(seq_group.clone()),
+                    //         latch["in"] = done_guard ? (signal_on.clone());
+                    //         latch["write_en"] = done_guard ? (signal_on.clone());
+                    //     );
+                    //     // CLEANUP wires
+                    //     add_wires!(
+                    //         st, None,
+                    //         latch["in"] = seq_done ? (signal_off.clone());
+                    //         latch["write_en"] = seq_done ? (signal_on.clone());
+                    //     );
+                    //     guard!(st; latch["out"])
+                    // } else {
+                    //     guard!(st; group["done"])
+                    // };
 
                     structure!(
                         st, &ctx,
-                        // let fsm_cur_state = constant(my_idx, fsm_size);
-                        // let fsm_nxt_state = constant(my_idx + 1, fsm_size);
                         let started = prim std_reg(1);
-                        let done_reg = prim std_reg(1);
                     );
 
-                    // let group_go = match prev_done {
-                    //     Some(g) => {
-                    //         guard!(st; fsm["out"])
-                    //             .eq(st.to_guard(fsm_cur_state.clone()))
-                    //             | g
-                    //     }
-                    //     None => guard!(st; fsm["out"])
-                    //         .eq(st.to_guard(fsm_cur_state.clone())),
-                    // };
                     let start = match prev_done.clone() {
-                        Some(g) => g & !guard!(st; done_reg["out"]),
-                        None => !guard!(st; done_reg["out"]),
+                        Some(g) => g & !done_latch.clone(),
+                        None => !done_latch.clone(),
                     };
                     let group_go = match prev_done.clone() {
                         Some(g) => {
-                            (g | guard!(st; started["out"]))
-                                & !guard!(st; done_reg["out"])
+                            (g | guard!(st; started["out"])) & !done_latch
                         }
-                        None => !guard!(st; done_reg["out"]),
+                        None => !done_latch,
                     };
 
-                    // let group_done = (guard!(st; fsm["out"])
-                    //     .eq(st.to_guard(fsm_cur_state.clone())))
-                    //     & guard!(st; group["done"]);
-                    let group_done = match prev_done {
-                        Some(g) => (g & guard!(st; group["done"])),
-                        None => guard!(st; group["done"]),
-                    };
+                    // let group_done = match prev_done {
+                    //     Some(g) => (g & guard!(st; group["done"])),
+                    //     None => guard!(st; group["done"]),
+                    // };
 
                     add_wires!(
                         st, Some(seq_group.clone()),
@@ -423,23 +476,13 @@ impl Visitor for CompileControl {
                         started["in"] = start ? (signal_on.clone());
                         started["write_en"] = start ? (signal_on.clone());
 
-                        // save groups done signal
-                        done_reg["in"] = group_done ? (signal_on.clone());
-                        done_reg["write_en"] = group_done ? (signal_on.clone());
-
                         // Turn this group on.
                         group["go"] = group_go ? (signal_on.clone());
-
-                        // Update the FSM state when this group is done.
-                        // fsm["in"] = group_done ? (fsm_nxt_state.clone());
-                        // fsm["write_en"] = group_done ? (signal_on.clone());
                     );
 
                     // CLEANUP: Reset the done registers.
                     add_wires!(
                         st, None,
-                        done_reg["in"] = seq_done ? (signal_off.clone());
-                        done_reg["write_en"] = seq_done ? (signal_on.clone());
                         started["in"] = seq_done ? (signal_off.clone());
                         started["write_en"] = seq_done ? (signal_on.clone());
                     );
@@ -455,24 +498,11 @@ impl Visitor for CompileControl {
             }
         }
 
-        // let final_state_val: u64 = s.stmts.len().try_into().unwrap();
-        // structure!(st, &ctx,
-        //     let reset_val = constant(0, fsm_size);
-        //     let fsm_final_state = constant(final_state_val, fsm_size);
-        // );
-        // let seq_done = guard!(st; fsm["out"]).eq(st.to_guard(fsm_final_state));
-
         // // Condition for the seq group being done.
         let last_done = prev_done.unwrap();
         add_wires!(st, Some(seq_group.clone()),
             seq_group_node["done"] = last_done ? (signal_on.clone());
         );
-
-        // // CLEANUP: Reset the FSM state one cycle after the done signal is high.
-        // add_wires!(st, None,
-        //     fsm["in"] = seq_done ? (reset_val);
-        //     fsm["write_en"] = seq_done ? (signal_on);
-        // );
 
         // Replace the control with the seq group.
         Ok(Action::Change(Control::enable(seq_group)))
@@ -496,7 +526,8 @@ impl Visitor for CompileControl {
             Vec::with_capacity(s.stmts.len());
         let mut par_done_regs = Vec::with_capacity(s.stmts.len());
 
-        structure!(st, &ctx,
+        structure!(
+            st, &ctx,
             let signal_on = constant(1, 1);
             let signal_off = constant(0, 1);
             let par_reset = prim std_reg(1);
@@ -514,15 +545,26 @@ impl Visitor for CompileControl {
                         let par_done_reg = prim std_reg(1);
                     );
 
-                    let group_go = !(guard!(st; par_done_reg["out"])
-                        | guard!(st; group_idx["done"]));
-                    let group_done = guard!(st; group_idx["done"]);
+                    // create latch of group is combinational
+                    let done_latch = latch_combinational(
+                        st,
+                        ctx,
+                        par_group.clone(),
+                        group_idx,
+                        group_name,
+                        guard!(st; par_group_idx["done"]),
+                    )?;
 
-                    add_wires!(st, Some(par_group.clone()),
+                    let group_go =
+                        !(guard!(st; par_done_reg["out"]) | done_latch.clone());
+                    // let group_done = guard!(st; group_idx["done"]);
+
+                    add_wires!(
+                        st, Some(par_group.clone()),
                         group_idx["go"] = group_go ? (signal_on.clone());
 
-                        par_done_reg["in"] = group_done ? (signal_on.clone());
-                        par_done_reg["write_en"] = group_done ? (signal_on.clone());
+                        par_done_reg["in"] = done_latch ? (signal_on.clone());
+                        par_done_reg["write_en"] = done_latch ? (signal_on.clone());
                     );
 
                     par_done_regs.push(par_done_reg);
@@ -542,21 +584,24 @@ impl Visitor for CompileControl {
         // Hook up parent's done signal to all children.
         let par_done = GuardExpr::and_vec(par_group_done);
         let par_reset_out = guard!(st; par_reset["out"]);
-        add_wires!(st, Some(par_group.clone()),
+        add_wires!(
+            st, Some(par_group.clone()),
             par_reset["in"] = par_done ? (signal_on.clone());
             par_reset["write_en"] = par_done ? (signal_on.clone());
             par_group_idx["done"] = par_reset_out ? (signal_on.clone());
         );
 
         // reset wires
-        add_wires!(st, None,
+        add_wires!(
+            st, None,
             par_reset["in"] = par_reset_out ? (signal_off.clone());
             par_reset["write_en"] = par_reset_out ? (signal_on.clone());
         );
         for par_done_reg in par_done_regs {
-            add_wires!(st, None,
-                       par_done_reg["in"] = par_reset_out ? (signal_off.clone());
-                       par_done_reg["write_en"] = par_reset_out ? (signal_on.clone());
+            add_wires!(
+                st, None,
+                par_done_reg["in"] = par_reset_out ? (signal_off.clone());
+                par_done_reg["write_en"] = par_reset_out ? (signal_on.clone());
             );
         }
 
